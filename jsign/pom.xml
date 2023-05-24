@@ -31,6 +31,12 @@
       <artifactId>jsign-cli</artifactId>
       <version>${project.version}</version>
     </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-nop</artifactId>
+      <version>1.7.36</version>
+    </dependency>
   </dependencies>
 
   <build>
@@ -96,6 +102,18 @@
                     <exclude>**/bouncycastle/pqc/**</exclude>
                   </excludes>
                 </filter>
+                <filter>
+                   <artifact>commons-logging:commons-logging</artifact>
+                   <includes>
+                       <include>**</include>
+                   </includes>
+                </filter>
+                <filter>
+                  <artifact>org.slf4j:slf4j-nop</artifact>
+                  <includes>
+                      <include>**</include>
+                  </includes>
+                </filter>
               </filters>
               <relocations>
                 <relocation>
@@ -156,6 +174,8 @@
                 <option>-keep public class net.jsign.pe.* { *; }</option>
                 <option>-keep public class net.jsign.script.* { *; }</option>
                 <option>-keep public class net.jsign.timestamp.* { *; }</option>
+                <option>-keep public class net.jsign.commons.logging.impl.* { *; }</option>
+                <option>-keep public class org.slf4j.nop.* { *; }</option>
                 <option>-keeppackagenames net.jsign</option>
                 <option>-keepclassmembers class * extends java.lang.Enum { *; }</option>
               </options>

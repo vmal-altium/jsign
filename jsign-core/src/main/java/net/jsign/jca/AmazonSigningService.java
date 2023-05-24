@@ -16,39 +16,27 @@
 
 package net.jsign.jca;
 
-import java.io.IOException;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.security.GeneralSecurityException;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.KeyStoreException;
-import java.security.MessageDigest;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.Certificate;
-import java.text.DateFormat;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Collections;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TimeZone;
-import java.util.TreeMap;
 import java.util.function.Function;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
-
-import com.cedarsoftware.util.io.JsonWriter;
-import org.apache.commons.codec.binary.Hex;
 
 import net.jsign.DigestAlgorithm;
 
-import static java.nio.charset.StandardCharsets.*;
+import software.amazon.awssdk.auth.credentials.*;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.kms.KmsClient;
+import software.amazon.awssdk.services.kms.KmsClientBuilder;
+import software.amazon.awssdk.services.kms.model.*;
 
 /**
  * Signing service using the AWS API.
@@ -65,7 +53,7 @@ public class AmazonSigningService implements SigningService {
     /** Cache of private keys indexed by id */
     private final Map<String, SigningServicePrivateKey> keys = new HashMap<>();
 
-    private final RESTClient client;
+    private final KmsClient kms;
 
     /** Mapping between Java and AWS signing algorithms */
     private final Map<String, String> algorithmMapping = new HashMap<>();
@@ -90,17 +78,25 @@ public class AmazonSigningService implements SigningService {
      */
     public AmazonSigningService(String region, String credentials, Function<String, Certificate[]> certificateStore) {
         this.certificateStore = certificateStore;
+        KmsClientBuilder kmsClientBuilder = KmsClient.builder()
+                .region(Region.of(region))
+                .httpClientBuilder(UrlConnectionHttpClient.builder());
 
-        // parse the credentials
-        String[] elements = credentials.split("\\|", 3);
-        if (elements.length < 2) {
-            throw new IllegalArgumentException("Invalid AWS credentials: " + credentials);
+        if (credentials != null) {
+            // parse the credentials
+            String[] elements = credentials.split("\\|", 3);
+            if (elements.length < 2) {
+                throw new IllegalArgumentException("Invalid AWS credentials: " + credentials);
+            }
+            String accessKey = elements[0];
+            String secretKey = elements[1];
+            String sessionToken = elements.length > 2 ? elements[2] : null;
+            AwsCredentials awsCredentials = sessionToken != null
+                    ? AwsSessionCredentials.create(accessKey, secretKey, sessionToken)
+                    : AwsBasicCredentials.create(accessKey, secretKey);
+            kmsClientBuilder = kmsClientBuilder.credentialsProvider(StaticCredentialsProvider.create(awsCredentials));
         }
-        String accessKey = elements[0];
-        String secretKey = elements[1];
-        String sessionToken = elements.length > 2 ? elements[2] : null;
-
-        this.client = new RESTClient("https://kms." + region + ".amazonaws.com", (conn, data) -> sign(conn, accessKey, secretKey, sessionToken, data, null));
+        this.kms = kmsClientBuilder.build();
     }
 
     @Override
@@ -114,12 +110,12 @@ public class AmazonSigningService implements SigningService {
 
         try {
             // kms:ListKeys (https://docs.aws.amazon.com/kms/latest/APIReference/API_ListKeys.html)
-            Map<String, ?> response = query("TrentService.ListKeys", "{}");
-            Object[] keys = (Object[]) response.get("Keys");
-            for (Object key : keys) {
-                aliases.add((String) ((Map) key).get("KeyId"));
+            ListKeysResponse response = kms.listKeys();
+            List<KeyListEntry> keys =  response.keys();
+            for (KeyListEntry key : keys) {
+                aliases.add(key.keyId());
             }
-        } catch (IOException e) {
+        } catch (SdkException e) {
             throw new KeyStoreException(e);
         }
 
@@ -141,22 +137,22 @@ public class AmazonSigningService implements SigningService {
 
         try {
             // kms:DescribeKey (https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html)
-            Map<String, ?> response = query("TrentService.DescribeKey", "{\"KeyId\":\"" + normalizeKeyId(alias) + "\"}");
-            Map<String, ?> keyMetadata = (Map<String, ?>) response.get("KeyMetadata");
+            DescribeKeyResponse response = kms.describeKey(DescribeKeyRequest.builder().keyId(normalizeKeyId(alias)).build());
+            KeyMetadata keyMetadata = response.keyMetadata();
 
-            String keyUsage = (String) keyMetadata.get("KeyUsage");
+            String keyUsage = keyMetadata.keyUsageAsString();
             if (!"SIGN_VERIFY".equals(keyUsage)) {
                 throw new UnrecoverableKeyException("The key '" + alias + "' is not a signing key");
             }
 
-            String keyState = (String) keyMetadata.get("KeyState");
+            String keyState = keyMetadata.keyStateAsString();
             if (!"Enabled".equals(keyState)) {
                 throw new UnrecoverableKeyException("The key '" + alias + "' is not enabled (" + keyState + ")");
             }
 
-            String keySpec = (String) keyMetadata.get("KeySpec");
+            String keySpec = keyMetadata.keySpecAsString();
             algorithm = keySpec.substring(0, keySpec.indexOf('_'));
-        } catch (IOException e) {
+        } catch (SdkException e) {
             throw (UnrecoverableKeyException) new UnrecoverableKeyException("Unable to fetch AWS key '" + alias + "'").initCause(e);
         }
 
@@ -175,31 +171,18 @@ public class AmazonSigningService implements SigningService {
         DigestAlgorithm digestAlgorithm = DigestAlgorithm.of(algorithm.substring(0, algorithm.toLowerCase().indexOf("with")));
         data = digestAlgorithm.getMessageDigest().digest(data);
 
-        // kms:Sign (https://docs.aws.amazon.com/kms/latest/APIReference/API_Sign.html)
-        Map<String, String> request = new HashMap<>();
-        request.put("KeyId", normalizeKeyId(privateKey.getId()));
-        request.put("MessageType", "DIGEST");
-        request.put("Message", Base64.getEncoder().encodeToString(data));
-        request.put("SigningAlgorithm", alg);
-        request.put(JsonWriter.TYPE, "false");
-
         try {
-            Map<String, ?> response = query("TrentService.Sign", JsonWriter.objectToJson(request));
-            String signature = (String) response.get("Signature");
-            return Base64.getDecoder().decode(signature);
-        } catch (IOException e) {
+            // kms:Sign (https://docs.aws.amazon.com/kms/latest/APIReference/API_Sign.html)
+            SignResponse response = kms.sign(SignRequest.builder()
+                    .keyId(normalizeKeyId(privateKey.getId()))
+                    .messageType(MessageType.DIGEST)
+                    .message(SdkBytes.fromByteArray(data))
+                    .signingAlgorithm(alg)
+                    .build());
+            return response.signature().asByteArray();
+        } catch (SdkException e) {
             throw new GeneralSecurityException(e);
         }
-    }
-
-    /**
-     * Sends a request to the AWS API.
-     */
-    private Map<String, ?> query(String target, String body) throws IOException {
-        Map<String, String> headers = new HashMap<>();
-        headers.put("X-Amz-Target", target);
-        headers.put("Content-Type", "application/x-amz-json-1.1");
-        return client.post("/", body, headers);
     }
 
     /**
@@ -215,98 +198,5 @@ public class AmazonSigningService implements SigningService {
         } else {
             return keyId;
         }
-    }
-
-    /**
-     * Signs the request
-     *
-     * @see <a href="https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html">Signature Version 4 signing process</a>
-     */
-    void sign(HttpURLConnection conn, String accessKey, String secretKey, String sessionToken, byte[] content, Date date) {
-        DateFormat dateFormat = new SimpleDateFormat("yyyyMMdd");
-        dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
-        DateFormat dateTimeFormat = new SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'");
-        dateTimeFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
-        if (date == null) {
-            date = new Date();
-        }
-
-        // Extract the service name and the region from the endpoint
-        URL endpoint = conn.getURL();
-        Pattern hostnamePattern = Pattern.compile("^([^.]+)\\.([^.]+)\\.amazonaws\\.com$");
-        String host = endpoint.getHost();
-        Matcher matcher = hostnamePattern.matcher(host);
-        String regionName = matcher.matches() ? matcher.group(2) : "us-east-1";
-        String serviceName = matcher.matches() ? matcher.group(1) : host.substring(0, host.indexOf('.'));
-
-        String credentialScope = dateFormat.format(date) + "/" + regionName + "/" + serviceName + "/" + "aws4_request";
-
-        conn.addRequestProperty("X-Amz-Date", dateTimeFormat.format(date));
-
-        // Create the canonical request (https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html)
-        Map<String, List<String>> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        headers.putAll(conn.getRequestProperties());
-        headers.put("Host", Collections.singletonList(host));
-
-        String canonicalRequest = conn.getRequestMethod() + "\n"
-                + endpoint.getPath() + (endpoint.getPath().endsWith("/") ? "" : "/") + "\n"
-                + /* canonical query string, not used for kms operations */ "\n"
-                + canonicalHeaders(headers) + "\n"
-                + signedHeaders(headers) + "\n"
-                + sha256(content);
-
-        // Create the string to sign (https://docs.aws.amazon.com/general/latest/gr/sigv4-create-string-to-sign.html)
-        String stringToSign = "AWS4-HMAC-SHA256" + "\n"
-                + dateTimeFormat.format(date) + "\n"
-                + credentialScope + "\n"
-                + sha256(canonicalRequest.getBytes(UTF_8));
-
-        // Derive the signing key (https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html)
-        byte[] key = ("AWS4" + secretKey).getBytes(UTF_8);
-        byte[] signingKey = hmac("aws4_request", hmac(serviceName, hmac(regionName, hmac(dateFormat.format(date), key))));
-
-        // Compute the signature (https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html)
-        byte[] signature = hmac(stringToSign, signingKey);
-
-        conn.setRequestProperty("Authorization",
-                "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + credentialScope
-                + ", SignedHeaders=" + signedHeaders(headers)
-                + ", Signature=" + Hex.encodeHexString(signature).toLowerCase());
-
-        if (sessionToken != null) {
-            conn.setRequestProperty("X-Amz-Security-Token", sessionToken);
-        }
-    }
-
-    private String canonicalHeaders(Map<String, List<String>> headers) {
-        return headers.entrySet().stream()
-                .map(entry -> entry.getKey().toLowerCase() + ":" + String.join(",", entry.getValue()).replaceAll("\\s+", " "))
-                .collect(Collectors.joining("\n")) + "\n";
-    }
-
-    private String signedHeaders(Map<String, List<String>> headers) {
-        return headers.keySet().stream()
-                .map(String::toLowerCase)
-                .collect(Collectors.joining(";"));
-    }
-
-    private byte[] hmac(String data, byte[] key) {
-        return hmac(data.getBytes(UTF_8), key);
-    }
-
-    private byte[] hmac(byte[] data, byte[] key) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(key, mac.getAlgorithm()));
-            return mac.doFinal(data);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private String sha256(byte[] data) {
-        MessageDigest digest =  DigestAlgorithm.SHA256.getMessageDigest();
-        digest.update(data);
-        return Hex.encodeHexString(digest.digest()).toLowerCase();
     }
 }

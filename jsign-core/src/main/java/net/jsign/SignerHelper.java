@@ -335,9 +335,6 @@ class SignerHelper {
             if (keystore == null) {
                 throw new SignerException("keystore " + parameterName + " must specify the AWS region");
             }
-            if (storepass == null) {
-                throw new SignerException("storepass " + parameterName + " must specify the AWS credentials: <accessKey>|<secretKey>[|<sessionToken>]");
-            }
             if (certfile == null) {
                 throw new SignerException("certfile " + parameterName + " must be set");
             }
