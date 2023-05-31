@@ -17,12 +17,14 @@
 package net.jsign.jca;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.GeneralSecurityException;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.KeyStoreException;
 import java.security.MessageDigest;
+import java.security.PublicKey;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.Certificate;
 import java.text.DateFormat;
@@ -45,6 +47,11 @@ import javax.crypto.spec.SecretKeySpec;
 
 import com.cedarsoftware.util.io.JsonWriter;
 import org.apache.commons.codec.binary.Hex;
+import org.bouncycastle.crypto.params.AsymmetricKeyParameter;
+import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.crypto.params.ECKeyParameters;
+import org.bouncycastle.crypto.params.RSAKeyParameters;
+import org.bouncycastle.crypto.util.PublicKeyFactory;
 
 import net.jsign.DigestAlgorithm;
 
@@ -64,6 +71,9 @@ public class AmazonSigningService implements SigningService {
 
     /** Cache of private keys indexed by id */
     private final Map<String, SigningServicePrivateKey> keys = new HashMap<>();
+
+    /** Cache of certificate chains by id */
+    private final Map<String, Certificate[]> certificates = new HashMap<>();
 
     private final RESTClient client;
 
@@ -128,7 +138,12 @@ public class AmazonSigningService implements SigningService {
 
     @Override
     public Certificate[] getCertificateChain(String alias) throws KeyStoreException {
-        return certificateStore.apply(alias);
+        if (certificates.containsKey(alias)) {
+            return certificates.get(alias);
+        }
+        Certificate[] certificateChain = certificateStore.apply(alias);
+        certificates.put(alias, certificateChain);
+        return certificateChain;
     }
 
     @Override
@@ -156,8 +171,42 @@ public class AmazonSigningService implements SigningService {
 
             String keySpec = (String) keyMetadata.get("KeySpec");
             algorithm = keySpec.substring(0, keySpec.indexOf('_'));
+
+            // kms:GetPublicKey (https://docs.aws.amazon.com/kms/latest/APIReference/API_GetPublicKey.html)
+            response = query("TrentService.GetPublicKey", "{\"KeyId\":\"" + normalizeKeyId(alias) + "\"}");
+            String publicKeyString = (String) response.get("PublicKey");
+            AsymmetricKeyParameter kmsPublicKey = PublicKeyFactory
+                    .createKey(Base64.getDecoder().decode(publicKeyString.getBytes()));
+
+            Certificate[] chain = getCertificateChain(alias);
+            PublicKey certificatePublicKey_ = chain[0].getPublicKey();
+            AsymmetricKeyParameter certificatePublicKey = PublicKeyFactory.createKey(certificatePublicKey_.getEncoded());
+
+            // We try to ensure that the private key stored in KMS matches the provided certificate
+            String certificateAlgorithm = certificatePublicKey_.getAlgorithm();
+            if (!certificateAlgorithm.equals(algorithm)) {
+                throw new UnrecoverableKeyException("The algorithm of the private key '" + alias + "' (" + algorithm
+                        + ") differs from that of the certificate (" + certificateAlgorithm + ")");
+            }
+            if (algorithm.equals("RSA")) {
+                BigInteger kmsModulus = ((RSAKeyParameters) kmsPublicKey).getModulus();
+                BigInteger certificateModulus = ((RSAKeyParameters) certificatePublicKey).getModulus();
+                if (!certificateModulus.equals(kmsModulus)) {
+                    throw new UnrecoverableKeyException(
+                            "The private key '" + alias + "' does not match the certificate");
+                }
+            } else if (algorithm.equals("ECC")) {
+                ECDomainParameters kmsECParams = ((ECKeyParameters) kmsPublicKey).getParameters();
+                ECDomainParameters certificateECParams = ((ECKeyParameters) certificatePublicKey).getParameters();
+                if (!certificateECParams.equals(kmsECParams)) {
+                    throw new UnrecoverableKeyException(
+                            "The private key '" + alias + "' does not match the certificate");
+                }
+            }
         } catch (IOException e) {
             throw (UnrecoverableKeyException) new UnrecoverableKeyException("Unable to fetch AWS key '" + alias + "'").initCause(e);
+        } catch (KeyStoreException e) {
+            throw (UnrecoverableKeyException) new UnrecoverableKeyException("Unable to read certificate chain '" + alias + "'").initCause(e);
         }
 
         SigningServicePrivateKey key = new SigningServicePrivateKey(alias, algorithm);
